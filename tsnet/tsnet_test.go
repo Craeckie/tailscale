@@ -1182,7 +1182,7 @@ func setUpServiceState(t *testing.T, name, ip string, host, client *Server,
 	}
 	waitForLatestNetmap := func(t *testing.T, s *Server) {
 		t.Helper()
-		w := must.Get(s.localClient.WatchIPNBus(t.Context(), ipn.NotifyInitialNetMap))
+		w := must.Get(s.localClient.WatchIPNBus(t.Context(), ipn.NotifyInitialStatus))
 		defer w.Close()
 		for {
 			must.Get(w.Next())
@@ -3555,6 +3555,7 @@ func TestDeps(t *testing.T) {
 			"tailscale.com/feature/bird":                    "tsnet should not depend on BIRD integration",
 			"tailscale.com/feature/captiveportal":           "tsnet apps don't need captive portal detection; import it explicitly if desired",
 			"tailscale.com/feature/clientupdate":            "tsnet should not depend on feature/clientupdate",
+			"tailscale.com/feature/dnsresolvecache":         "tsnet apps don't persist DNS resolutions to disk by default; import it explicitly if desired",
 			"tailscale.com/feature/remoteconfig":            "tsnet should not depend on feature/remoteconfig",
 			"tailscale.com/feature/syspolicy":               "tsnet should not depend on syspolicy",
 			"tailscale.com/ipn/store/awsstore":              "tsnet callers wanting AWS state storage should import awsstore themselves",

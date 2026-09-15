@@ -93,8 +93,13 @@ type FeatureMeta struct {
 // Features are the known Tailscale features that can be selectively included or
 // excluded via build tags, and a description of each.
 var Features = map[FeatureTag]FeatureMeta{
-	"ace":           {Sym: "ACE", Desc: "Alternate Connectivity Endpoints"},
-	"acme":          {Sym: "ACME", Desc: "ACME TLS certificate management"},
+	"ace":  {Sym: "ACE", Desc: "Alternate Connectivity Endpoints"},
+	"acme": {Sym: "ACME", Desc: "ACME TLS certificate management"},
+	"androidbin": {
+		Sym:  "AndroidBin",
+		Desc: "Support for running raw (non-GUI app) binaries on Android: netmon interface discovery under the app sandbox",
+		Deps: []FeatureTag{"androiddns"},
+	},
 	"androiddns":    {Sym: "AndroidDNS", Desc: "DNS resolution via Android's dnsproxyd for standalone (non-app) binaries on Android"},
 	"appconnectors": {Sym: "AppConnectors", Desc: "App Connectors support"},
 	"aws":           {Sym: "AWS", Desc: "AWS integration"},
@@ -141,6 +146,10 @@ var Features = map[FeatureTag]FeatureMeta{
 	},
 	"completion": {Sym: "Completion", Desc: "CLI shell completion"},
 	"conn25":     {Sym: "Conn25", Desc: "Route traffic for configured domains through connector devices"},
+	"connreject": {
+		Sym:  "ConnReject",
+		Desc: "Connection-rejection diagnostics (TSMP rejects, pendopen timeouts) exposed over debug-rejects LocalAPI and c2n endpoints",
+	},
 	"completion_scripts": {
 		Sym: "CompletionScripts", Desc: "embed CLI shell completion scripts",
 		Deps: []FeatureTag{"completion"},
@@ -159,6 +168,7 @@ var Features = map[FeatureTag]FeatureMeta{
 		Deps: []FeatureTag{"portmapper"},
 	},
 	"desktop_sessions": {Sym: "DesktopSessions", Desc: "Desktop sessions support"},
+	"dnsresolvecache":  {Sym: "DNSResolveCache", Desc: "Persist successful DNS resolutions to disk for use on later boots with broken DNS"},
 	"doctor":           {Sym: "Doctor", Desc: "Diagnose possible issues with Tailscale and its host environment"},
 	"drive":            {Sym: "Drive", Desc: "Tailscale Drive (file server) support"},
 	"flashappliance":   {Sym: "FlashAppliance", Desc: "'tailscale configure flash-appliance' and 'pve-appliance' CLI commands for deploying Tailscale appliance images"},

@@ -194,7 +194,9 @@ type CapabilityVersion int
 //   - 143: 2026-07-22: Client correctly ignores conn25 node attributes when not enabled by environment variable
 //   - 144: 2026-07-31: Client sends [packet.TSMPDiscoKeyAdvertisement] around WireGuard handshakes
 //   - 145: 2026-08-04: Client understands [NodeAttrScopeQuad100OnMacOS]
-const CurrentCapabilityVersion CapabilityVersion = 145
+//   - 146: 2026-09-02: Client understands [NodeAttrConnReject]; can handle C2N /debug/rejects.
+//   - 147: 2026-09-09: Client handles 429/503 responses with retry-after headers to /machine/ endpoints
+const CurrentCapabilityVersion CapabilityVersion = 147
 
 // ID is an integer ID for a user, node, or login allocated by the
 // control plane.
@@ -2555,6 +2557,7 @@ const (
 	NodeAttrDisableTUNUDPGRO                     = nodecap.DisableTUNUDPGRO
 	NodeAttrDisableTUNTCPGRO                     = nodecap.DisableTUNTCPGRO
 	NodeAttrNeverGSOEqualTail                    = nodecap.NeverGSOEqualTail
+	NodeAttrConnReject                           = nodecap.ConnReject
 	// Deprecated: Do not add any further values here, use [nodecap] instead.
 
 	NodeAttrPrefixServices = nodecap.ServicesPrefix
