@@ -119,14 +119,21 @@ build_fuzzers() {
 	# disco (top-level)
 	build_fuzzer tailscale.com/disco FuzzDiscoParse disco_parse_fuzzer
 
+	# k8s-operator (sessionrecording/spdy)
+	build_fuzzer tailscale.com/k8s-operator/sessionrecording/spdy FuzzSpdyFrameParse spdy_frame_parse
+	build_fuzzer tailscale.com/k8s-operator/sessionrecording/spdy FuzzSpdyFrameParseHeaders spdy_frame_parse_headers
+	build_fuzzer tailscale.com/k8s-operator/sessionrecording/spdy FuzzParseHeaders spdy_parse_headers
+	build_fuzzer tailscale.com/k8s-operator/sessionrecording/spdy FuzzConnRead spdy_conn_read
+	build_fuzzer tailscale.com/k8s-operator/sessionrecording/spdy FuzzConnWrite spdy_conn_write
+
 	# net (dnscache, dns/resolver, packet, portmapper, stun, traffic)
 	build_fuzzer tailscale.com/net/dnscache FuzzGetDNSQueryCacheKey dnscache_get_dns_query_cache_key
 	build_fuzzer tailscale.com/net/dnscache FuzzAsciiLowerName dnscache_ascii_lower_name
 	build_fuzzer tailscale.com/net/dns/resolver FuzzClampEDNSSize dns_clamp_edns_size
 	build_fuzzer tailscale.com/net/packet FuzzParsedDecode packet_parsed_decode
+	build_fuzzer tailscale.com/net/packet FuzzParsedPayload packet_parsed_payload
 	build_fuzzer tailscale.com/net/packet FuzzDecode4 packet_decode4
 	build_fuzzer tailscale.com/net/packet FuzzDecode6 packet_decode6
-	build_fuzzer tailscale.com/net/packet FuzzDecode6Fragment packet_decode6_fragment
 	build_fuzzer tailscale.com/net/packet FuzzIP4Checksum packet_ip4_checksum
 	build_fuzzer tailscale.com/net/packet FuzzChecksumBytes packet_checksum_bytes
 	build_fuzzer tailscale.com/net/packet FuzzICMP6Checksum packet_icmp6_checksum
@@ -140,9 +147,6 @@ build_fuzzers() {
 	build_fuzzer tailscale.com/net/stun FuzzXorMappedAddress stun_xor_mapped_address
 	build_fuzzer tailscale.com/net/traffic FuzzNodeHasherCompare traffic_node_hasher_compare
 	build_fuzzer tailscale.com/net/traffic FuzzSortNodes traffic_sort_nodes
-
-	# tailcfg (top-level)
-	build_fuzzer tailscale.com/tailcfg FuzzNodeIsRouter tailcfg_node_isrouter
 
 	# tka (top-level)
 	build_fuzzer tailscale.com/tka FuzzAUMUnserializeValidate tka_aum_unserialize_validate
@@ -163,9 +167,6 @@ build_fuzzers() {
 	build_fuzzer tailscale.com/util/nocasemaps FuzzAppendToLower nocase_append_tolower
 	build_fuzzer tailscale.com/util/safediff FuzzDiff safediff_diff
 	build_fuzzer tailscale.com/util/zstdframe FuzzNextSize zstdframe_next_size
-
-	# wgengine (netlog)
-	build_fuzzer tailscale.com/wgengine/netlog FuzzQuotedLen netlog_quoted_len
 }
 
 prepare

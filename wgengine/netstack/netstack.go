@@ -55,6 +55,7 @@ import (
 	"tailscale.com/types/views"
 	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/set"
+	"tailscale.com/util/usermetric"
 	"tailscale.com/version"
 	"tailscale.com/wgengine"
 	"tailscale.com/wgengine/filter"
@@ -371,33 +372,28 @@ func Create(logf logger.Logf, tundev *tstun.Wrapper, e wgengine.Engine, mc *magi
 	ns.ctx, ns.ctxCancel = context.WithCancel(context.Background())
 	ns.atomicIsLocalIPFunc.Store(ipset.FalseContainsIPFunc())
 	ns.atomicIsVIPServiceIPFunc.Store(ipset.FalseContainsIPFunc())
-	ns.ipstack = stack.New(stack.Options{
+	opts := stack.Options{
 		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
 		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol, icmp.NewProtocol4, icmp.NewProtocol6},
-	})
-	sackEnabledOpt := tcpip.TCPSACKEnabled(true) // TCP SACK is disabled by default
-	tcpipErr := ns.ipstack.SetTransportProtocolOption(tcp.ProtocolNumber, &sackEnabledOpt)
-	if tcpipErr != nil {
-		return nil, fmt.Errorf("could not enable TCP SACK: %v", tcpipErr)
 	}
-	// See https://github.com/tailscale/tailscale/issues/9707
-	// gVisor's RACK performs poorly. ACKs do not appear to be handled in a
-	// timely manner, leading to spurious retransmissions and a reduced
-	// congestion window.
-	tcpRecoveryOpt := tcpip.TCPRecovery(0)
-	tcpipErr = ns.ipstack.SetTransportProtocolOption(tcp.ProtocolNumber, &tcpRecoveryOpt)
-	if tcpipErr != nil {
-		return nil, fmt.Errorf("could not disable TCP RACK: %v", tcpipErr)
+	if runtime.GOOS == "windows" {
+		// Windows monotonic clocks commonly update in 500us steps. RACK's loss
+		// detection compensates for this quantization when configured with an
+		// upper bound on the clock resolution, otherwise timestamp quantization
+		// alone can cause spurious loss declarations and retransmissions.
+		opts.ClockResolution = 500 * time.Microsecond
 	}
-	// gVisor defaults to reno at the time of writing. We explicitly set reno
-	// congestion control in order to prevent unexpected changes. Netstack
-	// has an int overflow in sender congestion window arithmetic that is more
-	// prone to trigger with cubic congestion control.
-	// See https://github.com/google/gvisor/issues/11632
-	renoOpt := tcpip.CongestionControlOption("reno")
-	tcpipErr = ns.ipstack.SetTransportProtocolOption(tcp.ProtocolNumber, &renoOpt)
+	ns.ipstack = stack.New(opts)
+	// CUBIC is the default congestion control on Linux, and is more
+	// appropriate for Tailscale's high-BDP paths than reno. Netstack
+	// previously suffered from an int overflow in CUBIC sender cwnd
+	// arithmetic (https://github.com/google/gvisor/issues/11632), which is
+	// why reno was pinned here; the CUBIC implementation has since been
+	// reworked to use float arithmetic with RFC 9438 target clamping.
+	cubicOpt := tcpip.CongestionControlOption("cubic")
+	tcpipErr := ns.ipstack.SetTransportProtocolOption(tcp.ProtocolNumber, &cubicOpt)
 	if tcpipErr != nil {
-		return nil, fmt.Errorf("could not set reno congestion control: %v", tcpipErr)
+		return nil, fmt.Errorf("could not set cubic congestion control: %v", tcpipErr)
 	}
 	err := setTCPBufSizes(ns.ipstack)
 	if err != nil {
@@ -447,11 +443,20 @@ func Create(logf logger.Logf, tundev *tstun.Wrapper, e wgengine.Engine, mc *magi
 	return ns, nil
 }
 
+// SetMetricsRegistry registers netstack's user-facing metrics with r, which
+// should be the registry used by ns's [tstun.Wrapper].
+func (ns *Impl) SetMetricsRegistry(r *usermetric.Registry) {
+	// Only WireGuard-bound packets are sent to other peers. Host and loopback
+	// drops are node-local, so they are reported only in debug and client metrics.
+	ns.linkEP.outboundDropped.Store(r.DroppedPacketsOutbound())
+}
+
 func (ns *Impl) Close() error {
 	stacksForMetrics.Delete(ns)
-	// Cancel the injection goroutines before ipstack.Wait closes linkEP's
-	// outbound queues. A nil queue read is expected only after cancellation.
+	// Cancel before closing the queues so consumers expect nil reads.
+	// Close linkEP before aborting endpoints that can generate replies.
 	ns.ctxCancel()
+	ns.linkEP.Close()
 	ns.ipstack.Close()
 	ns.ipstack.Wait()
 	ns.injectWG.Wait()
@@ -474,6 +479,17 @@ func init() {
 	// Please take care to avoid exporting clientmetrics with the same metric
 	// names as the ones used by Impl.ExpVar. Both get exposed via the same HTTP
 	// endpoint, and name collisions will result in Prometheus scraping errors.
+	clientmetric.NewCounterFunc("netstack_outbound_queue_full_dropped_packets", func() int64 {
+		var total int64
+		for ns := range stacksForMetrics.Keys() {
+			v := ns.linkEP.queueFullDroppedTotal()
+			if v > math.MaxInt64-total {
+				return math.MaxInt64
+			}
+			total += v
+		}
+		return total
+	})
 	clientmetric.NewCounterFunc("netstack_tcp_forward_dropped_attempts", func() int64 {
 		var total uint64
 		for ns := range stacksForMetrics.Keys() {
@@ -1058,9 +1074,14 @@ func (ns *Impl) injectToWireGuard() {
 			ns.logf("[v2] injectToWireGuard: % x",
 				stack.PayloadSince(pkt.NetworkHeader()).AsSlice())
 		}
-		if err := ns.tundev.InjectOutboundPacketBuffer(pkt); err != nil {
+		if err := ns.tundev.InjectOutboundPacketBufferContext(ns.ctx, pkt); err != nil {
+			if ns.ctx.Err() != nil || errors.Is(err, tstun.ErrClosed) {
+				return
+			}
 			ns.logf("netstack injectToWireGuard err: %v", err)
-			return
+			// A per-packet error must not terminate this long-lived pump:
+			// nothing manages or restarts a failed injectToWireGuard.
+			continue
 		}
 	}
 }
@@ -1102,7 +1123,16 @@ func (ns *Impl) injectToHost() {
 		}
 		if err := ns.tundev.InjectInboundPacketBuffer(pkt, inboundSlab, packets, writeBufs); err != nil {
 			ns.logf("netstack injectToHost err: %v", err)
-			return
+			// When failing to inject an outbound packet buffer, log the error, but
+			// continue serving the ReadContext for sending subsequent packets, as
+			// nothing manages or restarts a failed injectToHost. An error here
+			// only applies to the current packet and should not terminate the long-lived
+			// packet pump.
+			// The exception to this is if the context has ended, indicating a shutdown.
+			if ns.ctx.Err() != nil {
+				return
+			}
+			continue
 		}
 	}
 }
@@ -1414,7 +1444,7 @@ func (ns *Impl) userPing(dstIP netip.Addr, pingResPkt []byte, direction userPing
 		ns.logf("exec pinged %v in %v", dstIP, time.Since(t0))
 	}
 	if direction == userPingDirectionOutbound {
-		if err := ns.tundev.InjectOutbound(pingResPkt); err != nil {
+		if err := ns.tundev.InjectOutboundContext(ns.ctx, pingResPkt); err != nil && ns.ctx.Err() == nil && !errors.Is(err, tstun.ErrClosed) {
 			ns.logf("InjectOutbound ping response: %v", err)
 		}
 	} else if direction == userPingDirectionInbound {
@@ -1767,13 +1797,6 @@ func (ns *Impl) acceptTCP(r *tcp.ForwarderRequest) {
 	}
 }
 
-// tcpCloser is an interface to abstract around various TCPConn types that
-// allow closing of the read and write streams independently of each other.
-type tcpCloser interface {
-	CloseRead() error
-	CloseWrite() error
-}
-
 func (ns *Impl) forwardTCP(getClient func(...tcpip.SettableSocketOption) *gonet.TCPConn, clientRemoteIP netip.Addr, wq *waiter.Queue, dialAddr netip.AddrPort, isLocal bool) (handled bool) {
 	dialAddrStr := dialAddr.String()
 	if debugNetstack() {
@@ -1846,21 +1869,24 @@ func (ns *Impl) forwardTCP(getClient func(...tcpip.SettableSocketOption) *gonet.
 	// from stdDialer.DialContext (which has the requisite functions),
 	// or nil from hangDialer in tests (in which case we would have
 	// errored out by now), so this conversion should always succeed.
-	backendTCPCloser, backendIsTCPCloser := backend.(tcpCloser)
+	backendHalfCloser, backendIsHalfCloser := backend.(nettype.HalfCloser)
 	connClosed := make(chan error, 2)
+	// Each direction half-closes its destination once the source is done,
+	// so the destination's peer sees EOF while the other direction keeps
+	// flowing. Neither direction shuts down its source's read side: that
+	// has no effect on the wire, and once the source has returned EOF,
+	// macOS (and Linux, if the socket is fully closed by then) rejects the
+	// shutdown with ENOTCONN, which used to be logged for every connection.
 	go func() {
 		_, err := io.Copy(backend, client)
 		if err != nil {
 			err = fmt.Errorf("client -> backend: %w", err)
 		}
 		connClosed <- err
-		err = nil
-		if backendIsTCPCloser {
-			err = backendTCPCloser.CloseWrite()
-		}
-		err = errors.Join(err, client.CloseRead())
-		if err != nil {
-			ns.logf("client -> backend close connection: %v", err)
+		if backendIsHalfCloser {
+			if err := backendHalfCloser.CloseWrite(); err != nil {
+				ns.logf("client -> backend close connection: %v", err)
+			}
 		}
 	}()
 	go func() {
@@ -1869,12 +1895,7 @@ func (ns *Impl) forwardTCP(getClient func(...tcpip.SettableSocketOption) *gonet.
 			err = fmt.Errorf("backend -> client: %w", err)
 		}
 		connClosed <- err
-		err = nil
-		if backendIsTCPCloser {
-			err = backendTCPCloser.CloseRead()
-		}
-		err = errors.Join(err, client.CloseWrite())
-		if err != nil {
+		if err := client.CloseWrite(); err != nil {
 			ns.logf("backend -> client close connection: %v", err)
 		}
 	}()
@@ -2248,6 +2269,14 @@ func readStatCounter(sc *tcpip.StatCounter) int64 {
 // ExpVar returns an expvar variable suitable for registering with expvar.Publish.
 func (ns *Impl) ExpVar() expvar.Var {
 	m := new(metrics.Set)
+
+	for q, name := range map[outboundQueue]string{
+		outboundToWireGuard: "wireguard",
+		outboundToHost:      "host",
+		outboundLoopback:    "loopback",
+	} {
+		m.Set("counter_outbound_queue_full_dropped_packets_"+name, &ns.linkEP.queueFullDropped[q])
+	}
 
 	// Global metrics
 	stats := ns.ipstack.Stats()

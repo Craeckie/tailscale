@@ -44,8 +44,12 @@ import (
 	"tailscale.com/wgengine/filter"
 )
 
-// initListenConfig, if non-nil, is called during peerAPIListener setup.  It is used only
-// on iOS and macOS to set socket options to bind the listener to the Tailscale interface.
+// initListenConfig, if non-nil, is called during peerAPIListener setup.
+// On iOS and macOS, it sets socket options to bind the listener to the
+// Tailscale interface. On Linux, it binds the listener to the tunnel
+// interface, since peerapi traffic from other nodes is served by
+// netstack in userspace and the kernel listener only needs to serve
+// the local host.
 var initListenConfig func(config *net.ListenConfig, addr netip.Addr, tunIfIndex int) error
 
 // peerDNSQueryHandler is implemented by tsdns.Resolver.
@@ -58,13 +62,42 @@ type peerAPIServer struct {
 	resolver peerDNSQueryHandler
 }
 
+// skipKernelListener reports whether peerapi should not create a
+// kernel-level listener at all and instead rely on netstack intercepting
+// connections to the peerapi port. See [fakePeerAPIListener].
+func (s *peerAPIServer) skipKernelListener() bool {
+	switch runtime.GOOS {
+	case "android":
+		// Android for whatever reason often has problems creating the
+		// peerapi listener (Issues 4449, 4293). Since netstack
+		// intercepts the connections anyway, the kernel listener isn't
+		// needed.
+		return true
+	case "freebsd":
+		// FreeBSD is a weak-host stack like Linux: a kernel listener on
+		// the node's Tailscale IP would answer TCP handshakes from
+		// LAN-adjacent machines that address that IP at the node's NIC
+		// (tailscale/corp#48248). Linux fixes that with SO_BINDTODEVICE
+		// and macOS/iOS with IP_BOUND_IF, but FreeBSD has no per-socket
+		// equivalent, so skip the kernel listener entirely whenever
+		// netstack is present. Without netstack (ts_omit_netstack),
+		// the kernel listener is the only way to serve peers, and
+		// protecting it is left to pf; see the log line in
+		// [peerAPIServer.listen].
+		_, hasNetstack := s.b.sys.Netstack.GetOK()
+		return hasNetstack
+	}
+	return false
+}
+
 func (s *peerAPIServer) listen(ip netip.Addr, tunIfIndex int) (ln net.Listener, err error) {
-	// Android for whatever reason often has problems creating the peerapi listener.
-	// But since we started intercepting it with netstack, it's not even important that
-	// we have a real kernel-level listener. So just create a dummy listener on Android
-	// and let netstack intercept it.
-	if runtime.GOOS == "android" {
+	if s.skipKernelListener() {
 		return newFakePeerAPIListener(ip), nil
+	}
+	if runtime.GOOS == "freebsd" {
+		// No netstack, so a kernel listener is required; see
+		// skipKernelListener for why it is exposed.
+		s.b.logf("peerapi: no netstack in this build; the kernel listener on %v answers connections from any interface (FreeBSD's weak host model), so restrict it to the tunnel interface with pf", ip)
 	}
 
 	ipStr := ip.String()
@@ -73,13 +106,10 @@ func (s *peerAPIServer) listen(ip netip.Addr, tunIfIndex int) (ln net.Listener, 
 	if initListenConfig != nil {
 		// On iOS/macOS, this sets the lc.Control hook to
 		// setsockopt the interface index to bind to, to get
-		// out of the network sandbox.
-
-		// A zero tunIfIndex is invalid for peerapi.  A zero value will not get us
-		// out of the network sandbox.  Caller should log and retry.
-		if tunIfIndex == 0 {
-			return nil, fmt.Errorf("peerapi: cannot listen on %s with tunIfIndex 0", ipStr)
-		}
+		// out of the network sandbox. On Linux, it binds the
+		// listener to the tunnel interface so the kernel does
+		// not answer peerapi handshakes from the physical
+		// network; see initListenConfigTun.
 
 		if err := initListenConfig(&lc, ip, tunIfIndex); err != nil {
 			return nil, err
@@ -832,9 +862,14 @@ func (h *peerAPIHandler) handleDNSQuery(w http.ResponseWriter, r *http.Request) 
 	q, publicError := dohQuery(r)
 	if publicError != "" && r.Method == "GET" {
 		if name := r.FormValue("q"); name != "" {
-			pretty = true
-			publicError = ""
-			q = dnsQueryForName(name, r.FormValue("t"))
+			nameQuery, err := dnsQueryForName(name, r.FormValue("t"))
+			if err != nil {
+				publicError = "invalid name in ‘q’ parameter"
+			} else {
+				pretty = true
+				publicError = ""
+				q = nameQuery
+			}
 		}
 	}
 	if publicError != "" {
@@ -913,7 +948,10 @@ func dohQuery(r *http.Request) (dnsQuery []byte, publicErr string) {
 	}
 }
 
-func dnsQueryForName(name, typStr string) []byte {
+// dnsQueryForName builds a DNS query for name, which comes from the caller of
+// the peerAPI DNS debug mode and is not otherwise validated. It returns an
+// error if name does not fit in a DNS message.
+func dnsQueryForName(name, typStr string) ([]byte, error) {
 	typ := dnsmessage.TypeA
 	switch strings.ToLower(typStr) {
 	case "aaaa":
@@ -921,22 +959,27 @@ func dnsQueryForName(name, typStr string) []byte {
 	case "txt":
 		typ = dnsmessage.TypeTXT
 	}
+	if !strings.HasSuffix(name, ".") {
+		name += "."
+	}
+	qname, err := dnsmessage.NewName(name)
+	if err != nil {
+		return nil, err
+	}
 	b := dnsmessage.NewBuilder(nil, dnsmessage.Header{
 		OpCode:           0, // query
 		RecursionDesired: true,
 		ID:               1, // arbitrary, but 0 is rejected by some servers
 	})
-	if !strings.HasSuffix(name, ".") {
-		name += "."
-	}
 	b.StartQuestions()
-	b.Question(dnsmessage.Question{
-		Name:  dnsmessage.MustNewName(name),
+	if err := b.Question(dnsmessage.Question{
+		Name:  qname,
 		Type:  typ,
 		Class: dnsmessage.ClassINET,
-	})
-	msg, _ := b.Finish()
-	return msg
+	}); err != nil {
+		return nil, err
+	}
+	return b.Finish()
 }
 
 func writePrettyDNSReply(w io.Writer, res []byte) (err error) {
@@ -1100,8 +1143,10 @@ func newFakePeerAPIListener(ip netip.Addr) net.Listener {
 // for a given IP on port 1 (arbitrary) and can be Closed, but otherwise Accept
 // just blocks forever until closed. The purpose of this is to let the rest
 // of the LocalBackend/PeerAPI code run and think it's talking to the kernel,
-// even if the kernel isn't cooperating (like on Android: Issue 4449, 4293, etc)
-// or we lack permission to listen on a port. It's okay to not actually listen via
+// even if the kernel isn't cooperating (like on Android: Issue 4449, 4293, etc),
+// we lack permission to listen on a port, or a kernel listener would be
+// reachable from off the tailnet (FreeBSD; see [peerAPIServer.skipKernelListener]).
+// It's okay to not actually listen via
 // the kernel because on almost all platforms (except iOS as of 2022-04-20) we
 // also intercept incoming netstack TCP requests to our peerapi port and hand them over
 // directly to peerapi, without involving the kernel. So this doesn't need to be

@@ -1,7 +1,7 @@
 // Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
-//go:build !ts_omit_connreject
+//go:build !ts_omit_connreject && !ts_omit_netstack
 
 package tstun
 
@@ -36,7 +36,7 @@ func TestOutboundTSMPRecordsRejection(t *testing.T) {
 	go func() {
 		slab, packets := getSinglePacketReadArgs()
 		for {
-			n, err := w.Read(slab, packets)
+			n, err := w.injectionQueue.Read(slab, packets)
 			_ = n
 			if err != nil {
 				return
@@ -99,7 +99,7 @@ func TestSetConnRejectCallbackUninstall(t *testing.T) {
 	go func() {
 		slab, packets := getSinglePacketReadArgs()
 		for {
-			if _, err := w.Read(slab, packets); err != nil {
+			if _, err := w.injectionQueue.Read(slab, packets); err != nil {
 				return
 			}
 		}

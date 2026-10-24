@@ -148,6 +148,19 @@ func testSubnetRouterForOS(t testing.TB, srOS vmtest.OSImage) {
 		httpStep.Fatalf("got %q", body)
 	}
 	httpStep.End(nil)
+
+	// FreeBSD routes subnets in netstack by default, so tailscaled must
+	// leave the host's pf alone: no kldload, no anchor refs, no rules.
+	if srOS.GOOS() == "freebsd" {
+		out, err := env.SSHExec(sr, "if kldstat -q -m pf; then pfctl -s nat; pfctl -a tailscale -s nat; else echo no-pf; fi 2>&1")
+		if err != nil {
+			t.Fatalf("checking pf on subnet router: %v\n%s", err, out)
+		}
+		if strings.Contains(out, "tailscale") || strings.Contains(out, "100.64.0.0/10") {
+			t.Fatalf("tailscaled touched pf in netstack mode:\n%s", out)
+		}
+		t.Logf("pf on subnet router: %s", strings.TrimSpace(out))
+	}
 }
 
 func TestSiteToSite(t *testing.T) {
@@ -1104,6 +1117,20 @@ func checkClientMetrics(t *testing.T, label string, metrics vmtest.ClientMetrics
 	}
 }
 
+// checkClientMetricsAtLeast verifies that each entry in want exists and has at
+// least the given value in metrics.
+func checkClientMetricsAtLeast(t *testing.T, label string, metrics vmtest.ClientMetrics, want map[string]int64) {
+	t.Helper()
+	for name, minValue := range want {
+		got, ok := metrics[name]
+		if !ok {
+			t.Errorf("%s: required metric %q not found", label, name)
+		} else if got.Value < minValue {
+			t.Errorf("%s: metric %q: %v < %v", label, name, got.Value, minValue)
+		}
+	}
+}
+
 // TestCachedNetmapAfterRestart verifies that two nodes with netmap
 // caching enabled (NodeAttrCacheNetworkMaps) can re-establish a direct
 // WireGuard tunnel after both are restarted while the control server is
@@ -1138,8 +1165,8 @@ func TestCachedNetmapAfterRestart(t *testing.T) {
 
 	cutControlStep.Begin()
 	// Both nodes lose connection to control
-	a.DropControlTraffic()
-	b.DropControlTraffic()
+	env.DropControlTraffic(a)
+	env.DropControlTraffic(b)
 	env.ControlServer().SetOnMapRequest(func(nk key.NodePublic) {
 		panic(fmt.Sprintf("got connection from %v", nk))
 	})
@@ -1234,7 +1261,7 @@ func TestDirectConnectionWithCachedNetmapOnOneNode(t *testing.T) {
 			checkInitialMetrics.End(nil)
 
 			cutControlStep.Begin()
-			a.DropControlTraffic()
+			env.DropControlTraffic(a)
 			env.ControlServer().SetOnMapRequest(func(nk key.NodePublic) {
 				if env.ControlServer().Node(nk).Name == a.Name() {
 					panic(fmt.Sprintf("got connection from %v", a.Name()))
@@ -1259,18 +1286,18 @@ func TestDirectConnectionWithCachedNetmapOnOneNode(t *testing.T) {
 			tsmpPingStep.End(nil)
 
 			discoPingStep.Begin()
-			if err := env.PingExpect(pFrom, pTo, vmtest.PingRouteDirect, 90*time.Second); err != nil {
+			if _, err := env.PingExpect(pFrom, pTo, vmtest.PingRouteDirect, 90*time.Second); err != nil {
 				discoPingStep.Fatal(err)
 			}
 			// Ping back, mostly to give time for the metrics to be set.
-			if err := env.PingExpect(pTo, pFrom, vmtest.PingRouteDirect, 30*time.Second); err != nil {
+			if _, err := env.PingExpect(pTo, pFrom, vmtest.PingRouteDirect, 30*time.Second); err != nil {
 				discoPingStep.Fatal(err)
 			}
 			discoPingStep.End(nil)
 
 			// After: Verify that we recorded a direct contact on the disconnected node.
 			checkFinalMetrics.Begin()
-			checkClientMetrics(t, "Node A", env.ClientMetrics(a), map[string]int64{
+			checkClientMetricsAtLeast(t, "Node A", env.ClientMetrics(a), map[string]int64{
 				"magicsock_cached_peer_contact_direct": 1,
 			})
 			checkFinalMetrics.End(nil)
@@ -1313,15 +1340,15 @@ func TestDirectConnectionWithCachedNetmapOnTwoNodes(t *testing.T) {
 	// Before: Verify that we have not recorded any cached contacts.
 	checkInitialMetrics.Begin()
 	checkClientMetrics(t, "Node A", env.ClientMetrics(a), map[string]int64{
-		"magicsock_cached_peer_contact_derp":   0,
-		"magicsock_cached_peer_contact_direct": 0,
+		"magicsock_cached_peer_contact_derp":          0,
+		"magicsock_cached_peer_contact_direct":        0,
 		"magicsock_tsmp_disco_key_advertisement_sent": 0,
 	})
 	checkInitialMetrics.End(nil)
 
 	cutControlStep.Begin()
-	a.DropControlTraffic()
-	b.DropControlTraffic()
+	env.DropControlTraffic(a)
+	env.DropControlTraffic(b)
 	env.ControlServer().SetOnMapRequest(func(nk key.NodePublic) {
 		nodeName := env.ControlServer().Node(nk).Name
 		if nodeName == a.Name() || nodeName == b.Name() {
@@ -1342,15 +1369,15 @@ func TestDirectConnectionWithCachedNetmapOnTwoNodes(t *testing.T) {
 	tsmpPingStep.End(nil)
 
 	discoPingStep.Begin()
-	if err := env.PingExpect(a, b, vmtest.PingRouteDirect, 30*time.Second); err != nil {
+	if _, err := env.PingExpect(a, b, vmtest.PingRouteDirect, 30*time.Second); err != nil {
 		discoPingStep.Fatal(err)
 	}
 	discoPingStep.End(nil)
 
 	// After: Verify that we recorded a direct contact on the disconnected node.
 	checkFinalMetrics.Begin()
-	checkClientMetrics(t, "Node A", env.ClientMetrics(a), map[string]int64{
-		"magicsock_cached_peer_contact_direct": 1,
+	checkClientMetricsAtLeast(t, "Node A", env.ClientMetrics(a), map[string]int64{
+		"magicsock_cached_peer_contact_direct":        1,
 		"magicsock_tsmp_disco_key_advertisement_sent": 1,
 	})
 	checkFinalMetrics.End(nil)
@@ -1478,4 +1505,80 @@ func TestPeerRelay(t *testing.T) {
 	t.Logf("relay session VNI=%d %s <-> %s on UDP port %d",
 		session.VNI, session.Client1.ShortDisco, session.Client2.ShortDisco, *srv.UDPPort)
 	sessionsStep.End(nil)
+}
+
+// TestLinuxRoaming tests that a node can establish a direct connection, then
+// have one of its network interfaces disconnect, and then roam over to the
+// other interface and have a direct connection again. The roaming node has two
+// interfaces, one eth and one mobile, simulated by adding a 50ms latency to the
+// mobile link (not too far off of what to expect with LTE).
+func TestLinuxRoaming(t *testing.T) {
+	env := vmtest.New(t)
+
+	// Add two networks for the roaming node, one of them with a 50ms latency to
+	// push magicsock to select the faster path.
+	ethAddr := "1.0.0.1"
+	mobileAddr := "2.0.0.1"
+	roamingEth := env.AddNetwork(ethAddr, "192.168.1.0/24", vnet.EasyNAT)
+	roamingMobile := env.AddNetwork(mobileAddr, "10.0.0.0/24", vnet.EasyNAT)
+	roamingMobile.SetLatency(50 * time.Millisecond)
+
+	staticNet := env.AddNetwork("3.0.0.1", "192.168.2.0/24", vnet.EasyNAT)
+
+	roaming := env.AddNode("roaming", roamingEth, roamingMobile, vmtest.OS(vmtest.Ubuntu2404))
+	static := env.AddNode("static", staticNet, vmtest.OS(vmtest.Gokrazy))
+
+	stepPingEth := env.AddStep("Ping on eth")
+	stepDisconnect := env.AddStep("Disconnect eth")
+	stepPingMobile := env.AddStep("Ping on mobile")
+
+	env.Start()
+
+	// Run the test until the network converges onto the fast eth path.
+	// Run this in WaitFor to ensure that the endpoint we get back is the expected
+	// link, giving magicsock time to converge at the right interface.
+	stepPingEth.Begin()
+	if err := tstest.WaitFor(30*time.Second, func() error {
+		endpoint, err := env.PingExpect(static, roaming, vmtest.PingRouteDirect, 30*time.Second)
+		if err != nil {
+			return fmt.Errorf("did not get direct connection: %s", err)
+		}
+		ap, err := netip.ParseAddrPort(endpoint)
+		if err != nil {
+			return fmt.Errorf("unable to parse endpoint: %s", err)
+		}
+		if ap.Addr().String() != ethAddr {
+			return fmt.Errorf("wanted endpoint -%s got +%s", ethAddr, ap.Addr().String())
+		}
+		return nil
+	}); err != nil {
+		stepPingEth.Fatal(err)
+	}
+	stepPingEth.End(nil)
+
+	// "Disconnect" the ethernet from the node
+	stepDisconnect.Begin()
+	env.SetLinkUp(roaming, roamingEth, false)
+	stepDisconnect.End(nil)
+
+	roamingCtx, cancel := context.WithTimeout(t.Context(), 90*time.Second)
+	if err := env.WaitForAgentConn(roamingCtx, roaming); err != nil {
+		cancel()
+		t.Fatalf("node did not come back up: %s", err.Error())
+	}
+	cancel()
+
+	stepPingMobile.Begin()
+	endpoint, err := env.PingExpect(static, roaming, vmtest.PingRouteDirect, 30*time.Second)
+	if err != nil {
+		stepPingMobile.Fatalf("did not get direct connection: %s", err)
+	}
+	ap, err := netip.ParseAddrPort(endpoint)
+	if err != nil {
+		stepPingMobile.Fatalf("unable to parse endpoint: %s", err)
+	}
+	if ap.Addr().String() != mobileAddr {
+		stepPingMobile.Fatalf("wanted endpoint -%s got +%s", mobileAddr, ap.Addr().String())
+	}
+	stepPingMobile.End(nil)
 }

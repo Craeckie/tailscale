@@ -522,7 +522,7 @@ func (h *Handler) serveDebugLog(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, feature.ErrUnavailable.Error(), http.StatusNotImplemented)
 		return
 	}
-	if !h.PermitRead {
+	if !h.PermitWrite {
 		http.Error(w, "debug-log access denied", http.StatusForbidden)
 		return
 	}
@@ -565,6 +565,7 @@ func (h *Handler) serveDebugLog(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) serveDebugOptionalFeatures(w http.ResponseWriter, r *http.Request) {
 	of := &apitype.OptionalFeatures{
 		Features: feature.Registered(),
+		Disabled: feature.EnvDisabled(),
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(of)

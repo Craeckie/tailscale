@@ -172,6 +172,13 @@ func (b BinaryInfo) writeCopy(path string) error {
 // It fails tb if the build or binary copies fail.
 func GetBinaries(tb testing.TB) *Binaries {
 	dir := tb.TempDir()
+	// Working around an issue with GitHub runners where provjobd.exe can keep files
+	// open for longer than the 2s tb.TempDir's own cleanup allows. See #21099.
+	tb.Cleanup(func() {
+		if err := tstest.WaitFor(60*time.Second, func() error { return os.RemoveAll(dir) }); err != nil {
+			tb.Logf("removing %s: %v", dir, err)
+		}
+	})
 	buildOnce.Do(func() {
 		buildErr = buildTestBinaries(dir)
 	})
@@ -995,6 +1002,9 @@ func (n *TestNode) StartDaemonAsIPNGOOS(ipnGOOS string) *Daemon {
 		// On Windows, tailscaled defaults to a fixed port (41641).
 		// Force a random port to avoid collisions when running multiple test nodes.
 		cmd.Args = append(cmd.Args, "--port=0")
+		// The test's per-node pipe isn't under the administrators-only
+		// prefix that tailscaled otherwise insists on.
+		cmd.Args = append(cmd.Args, "--windows-mode=dev")
 	}
 	if *verboseTailscaled {
 		cmd.Args = append(cmd.Args, "-verbose=2")
@@ -1297,9 +1307,9 @@ func (n *TestNode) PublicKey() string {
 	return st.Self.PublicKey
 }
 
-// NLPublicKey returns the hex-encoded tailnet lock public key of
+// TLPublicKey returns the hex-encoded tailnet lock public key of
 // this node, e.g. `tlpub:123456abc`
-func (n *TestNode) NLPublicKey() string {
+func (n *TestNode) TLPublicKey() string {
 	tb := n.env.t
 	tb.Helper()
 	cmd := n.Tailscale("lock", "status", "--json")
@@ -1314,6 +1324,11 @@ func (n *TestNode) NLPublicKey() string {
 		tb.Fatalf("decoding `tailscale lock status` JSON: %v\njson:\n%s", err, out)
 	}
 	return st.PublicKey
+}
+
+// Deprecated: use [TestNode.TLPublicKey] instead.
+func (n *TestNode) NLPublicKey() string {
+	return n.TLPublicKey()
 }
 
 // trafficTrap is an HTTP proxy handler to note whether any

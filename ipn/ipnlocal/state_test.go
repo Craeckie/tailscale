@@ -634,7 +634,7 @@ func TestStateMachine(t *testing.T) {
 		// Verify login finished but need machine auth using backend state
 		c.Assert(isFullyAuthenticated(b), qt.IsTrue)
 		c.Assert(needsMachineAuth(b), qt.IsTrue)
-		nm := b.NetMap()
+		nm := b.NetMapNoPeers()
 		c.Assert(nm, qt.IsNotNil)
 		// For an empty netmap (after initial login), SelfNode may not be valid yet.
 		// In this case, we can't check MachineAuthorized, but needsMachineAuth already verified the state.
@@ -661,7 +661,7 @@ func TestStateMachine(t *testing.T) {
 		// nn[0] is a state notification after machine auth granted
 		c.Assert(len(nn), qt.Equals, 1)
 		// Verify machine authorized using backend state
-		nm := b.NetMap()
+		nm := b.NetMapNoPeers()
 		c.Assert(nm, qt.IsNotNil)
 		c.Assert(nm.SelfNode.Valid(), qt.IsTrue)
 		c.Assert(nm.SelfNode.MachineAuthorized(), qt.IsTrue)
@@ -1259,6 +1259,8 @@ func TestEngineReconfigOnStateChange(t *testing.T) {
 		wantPeers     []key.NodePublic
 		wantRouterCfg *router.Config
 		wantDNSCfg    *dns.Config
+
+		wantNodeRemoved bool // whether the node-removed warning is set
 	}{
 		{
 			name: "Initial",
@@ -1545,6 +1547,63 @@ func TestEngineReconfigOnStateChange(t *testing.T) {
 			wantRouterCfg: &router.Config{},
 			wantDNSCfg:    &dns.Config{},
 		},
+		{
+			name: "Start/Connect/Login/NodeRemoved",
+			steps: func(t *testing.T, lb *LocalBackend, cc func() *mockControl) {
+				mustDo(t)(lb.Start(ipn.Options{}))
+				mustDo2(t)(lb.EditPrefs(connect))
+				cc().authenticated(node1)
+				cc().send(sendOpt{err: fmt.Errorf("%w: initial fetch failed 404", controlclient.ErrNodeRemoved)})
+			},
+			// If control deletes the node, we want to disconnect:
+			wantState:       ipn.NeedsLogin,
+			wantCfg:         &wgcfg.Config{},
+			wantRouterCfg:   &router.Config{},
+			wantDNSCfg:      &dns.Config{},
+			wantNodeRemoved: true,
+		},
+		{
+			name: "Start/Connect/Login/NodeRemoved/NewProfile",
+			steps: func(t *testing.T, lb *LocalBackend, cc func() *mockControl) {
+				mustDo(t)(lb.Start(ipn.Options{}))
+				mustDo2(t)(lb.EditPrefs(connect))
+				cc().authenticated(node1)
+				cc().send(sendOpt{err: fmt.Errorf("%w: initial fetch failed 404", controlclient.ErrNodeRemoved)})
+				mustDo(t)(lb.NewProfile())
+			},
+			// The new profile is a different node, so the warning is cleared:
+			wantState:     ipn.NeedsLogin,
+			wantCfg:       &wgcfg.Config{},
+			wantRouterCfg: &router.Config{},
+			wantDNSCfg:    &dns.Config{},
+		},
+		{
+			name: "Start/Connect/Login/NodeRemoved/Login",
+			steps: func(t *testing.T, lb *LocalBackend, cc func() *mockControl) {
+				mustDo(t)(lb.Start(ipn.Options{}))
+				mustDo2(t)(lb.EditPrefs(connect))
+				cc().authenticated(node1)
+				cc().send(sendOpt{err: fmt.Errorf("%w: initial fetch failed 404", controlclient.ErrNodeRemoved)})
+				cc().authenticated(node1)
+			},
+			// A new netmap means the node is known to control again:
+			wantState: ipn.Starting,
+			wantCfg: &wgcfg.Config{
+				Addresses: node1.SelfNode.Addresses().AsSlice(),
+			},
+			wantRouterCfg: &router.Config{
+				SNATSubnetRoutes: true,
+				NetfilterMode:    preftype.NetfilterOn,
+				LocalAddrs:       node1.SelfNode.Addresses().AsSlice(),
+				Routes:           routesWithQuad100(),
+			},
+			wantDNSCfg: &dns.Config{
+				AcceptDNS:             true,
+				Routes:                map[dnsname.FQDN][]*dnstype.Resolver{},
+				Hosts:                 map[dnsname.FQDN][]netip.Addr{},
+				MagicDNSHostsUnrouted: true,
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -1558,6 +1617,9 @@ func TestEngineReconfigOnStateChange(t *testing.T) {
 
 			if gotState := lb.State(); gotState != tt.wantState {
 				t.Errorf("State: got %v; want %v", gotState, tt.wantState)
+			}
+			if got := lb.HealthTracker().IsUnhealthy(nodeRemovedWarnable); got != tt.wantNodeRemoved {
+				t.Errorf("node-removed warning set = %v; want %v", got, tt.wantNodeRemoved)
 			}
 
 			// Peers are not part of wgcfg.Config; the engine learns
@@ -2036,7 +2098,7 @@ func (e *mockEngine) Done() <-chan struct{} {
 
 // hasValidNetMap returns true if the backend has a valid network map with a valid self node.
 func hasValidNetMap(b *LocalBackend) bool {
-	nm := b.NetMap()
+	nm := b.NetMapNoPeers()
 	return nm != nil && nm.SelfNode.Valid()
 }
 
@@ -2055,8 +2117,8 @@ func needsLogin(b *LocalBackend) bool {
 // needsMachineAuth returns true if the user has logged in but the machine is not yet authorized.
 // This includes the case where we have a netmap but no valid SelfNode yet (empty netmap after initial login).
 func needsMachineAuth(b *LocalBackend) bool {
-	// Note: b.NetMap() and b.Prefs() handle their own locking
-	nm := b.NetMap()
+	// Note: b.NetMapNoPeers() and b.Prefs() handle their own locking
+	nm := b.NetMapNoPeers()
 	prefs := b.Prefs()
 	if prefs.LoggedOut() || nm == nil {
 		return false
@@ -2080,8 +2142,8 @@ func hasAuthURL(b *LocalBackend) bool {
 // canRouteTraffic returns true if the backend is capable of routing traffic.
 // This requires a valid netmap, machine authorization, and WantRunning preference.
 func canRouteTraffic(b *LocalBackend) bool {
-	// Note: b.NetMap() and b.Prefs() handle their own locking
-	nm := b.NetMap()
+	// Note: b.NetMapNoPeers() and b.Prefs() handle their own locking
+	nm := b.NetMapNoPeers()
 	prefs := b.Prefs()
 	return nm != nil &&
 		nm.SelfNode.Valid() &&
