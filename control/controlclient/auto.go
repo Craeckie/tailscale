@@ -601,7 +601,7 @@ func (c *Auto) mapRoutine() {
 		c.mu.Unlock()
 
 		report := func(err error, msg string) {
-			c.logf("[v1] %s: %v", msg, err)
+			c.logf("%s%s: %v", v1UnlessLive(ctx), msg, err)
 			err = fmt.Errorf("%s: %w", msg, err)
 			// don't send status updates for context errors,
 			// since context cancelation is always on purpose.

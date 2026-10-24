@@ -1184,7 +1184,8 @@ func (t *Tracker) updateBuiltinWarnablesLocked() {
 
 	if d := now.Sub(t.lastStreamedMapResponse).Round(time.Second); d > tooIdle {
 		t.setUnhealthyLocked(mapResponseTimeoutWarnable, Args{
-			ArgDuration: d.String(),
+			ArgDuration:            d.String(),
+			ArgLastMapRequestHeard: t.lastMapRequestHeardArgLocked(now),
 		})
 		return
 	} else {

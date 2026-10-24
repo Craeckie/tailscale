@@ -229,7 +229,7 @@ var mapResponseTimeoutWarnable = condRegister(func() *Warnable {
 		Severity:  SeverityMedium,
 		DependsOn: []*Warnable{NetworkStatusWarnable, IPNStateWarnable},
 		Text: func(args Args) string {
-			return fmt.Sprintf("Tailscale hasn't received a network map from the coordination server in %s.", args[ArgDuration])
+			return fmt.Sprintf("Tailscale hasn't received a network map from the coordination server in %s.", args[ArgDuration]) + mapResponseTimeoutDetail(args)
 		},
 	}
 })

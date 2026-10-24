@@ -1163,6 +1163,7 @@ func (c *Direct) sendMapRequest(ctx context.Context, isStreaming bool, nu Netmap
 
 	machinePubKey := machinePrivKey.Public()
 	t0 := c.clock.Now()
+	trace := newMapPollTrace(c.clock, t0)
 
 	httpc, err := c.getNoiseClient()
 	if err != nil {
@@ -1189,7 +1190,7 @@ func (c *Direct) sendMapRequest(ctx context.Context, isStreaming bool, nu Netmap
 			vlogf("netmap: ending timeout goroutine")
 			return
 		case <-watchdogTimedOut:
-			c.logf("map response long-poll timed out!")
+			c.logf("map response long-poll timed out! %v", trace)
 			cancel()
 			return
 		}
@@ -1203,7 +1204,7 @@ func (c *Direct) sendMapRequest(ctx context.Context, isStreaming bool, nu Netmap
 
 	res, err := httpc.Do(req)
 	if err != nil {
-		vlogf("netmap: Do: %v", err)
+		pollLogf(ctx, c.logf, vlogf)("netmap: Do: %v", err)
 		return err
 	}
 	vlogf("netmap: Do = %v after %v", res.StatusCode, time.Since(t0).Round(time.Millisecond))
@@ -1287,9 +1288,10 @@ func (c *Direct) sendMapRequest(ctx context.Context, isStreaming bool, nu Netmap
 			if ctx.Err() != nil {
 				err = ctx.Err()
 			}
-			vlogf("netmap: message read error after %v: %v", time.Since(t0).Round(time.Millisecond), err)
+			pollLogf(ctx, c.logf, vlogf)("netmap: message read error after %v (poll %v): %v", time.Since(t0).Round(time.Millisecond), mapResIdx, err)
 			return err
 		}
+		trace.noteMsg()
 		vlogf("netmap: read message of %d bytes after %v", len(msg), time.Since(t0).Round(time.Millisecond))
 
 		var resp tailcfg.MapResponse
